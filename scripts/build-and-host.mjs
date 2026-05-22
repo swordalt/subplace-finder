@@ -22,9 +22,102 @@ const contentTypes = {
 const robloxHeaders = {
   accept: 'application/json',
   origin: 'https://www.roblox.com',
-  referer: 'https://www.roblox.com/',
+  referer: 'https://www.roblox.com',
   'user-agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36',
+}
+
+function readHeaderValue(value) {
+  return Array.isArray(value) ? value[0] : value
+}
+
+function normalizeRobloxSecurityToken(value = '') {
+  const trimmedValue = value.trim()
+
+  if (!trimmedValue) {
+    return ''
+  }
+
+  const cookieMatch = trimmedValue.match(/(?:^|;\s*)\.ROBLOSECURITY=([^;]+)/i)
+
+  if (cookieMatch) {
+    return cookieMatch[1].trim()
+  }
+
+  return trimmedValue
+    .replace(/^cookie:\s*/i, '')
+    .replace(/^\.ROBLOSECURITY=/i, '')
+    .trim()
+}
+
+function getRobloxHeaders(request, targetUrl, csrfToken = '') {
+  const headers = { ...robloxHeaders }
+  const robloxSecurityToken = normalizeRobloxSecurityToken(
+    readHeaderValue(request.headers['x-roblox-security']),
+  )
+
+  if (robloxSecurityToken && new URL(targetUrl).hostname.endsWith('roblox.com')) {
+    headers.cookie = `.ROBLOSECURITY=${robloxSecurityToken}`
+  }
+
+  if (csrfToken) {
+    headers['x-csrf-token'] = csrfToken
+  }
+
+  return headers
+}
+
+async function fetchRoblox(request, targetUrl, options = {}) {
+  const headers = {
+    ...getRobloxHeaders(request, targetUrl),
+    ...options.headers,
+  }
+  let robloxResponse = await fetch(targetUrl, {
+    ...options,
+    headers,
+  })
+
+  if (robloxResponse.status === 403) {
+    const csrfToken = robloxResponse.headers.get('x-csrf-token')
+
+    if (csrfToken) {
+      robloxResponse = await fetch(targetUrl, {
+        ...options,
+        headers: {
+          ...headers,
+          'x-csrf-token': csrfToken,
+        },
+      })
+    }
+  }
+
+  return robloxResponse
+}
+
+async function fetchRobloxFollowingRedirects(request, targetUrl, options = {}) {
+  let currentUrl = targetUrl
+  let robloxResponse
+
+  for (let redirectCount = 0; redirectCount < 5; redirectCount += 1) {
+    robloxResponse = await fetchRoblox(request, currentUrl, {
+      ...options,
+      redirect: 'manual',
+    })
+
+    if (![301, 302, 303, 307, 308].includes(robloxResponse.status)) {
+      return robloxResponse
+    }
+
+    const location = robloxResponse.headers.get('location')
+
+    if (!location) {
+      return robloxResponse
+    }
+
+    currentUrl = new URL(location, currentUrl).toString()
+  }
+
+  return robloxResponse
 }
 
 function npmProcessArgs(args) {
@@ -68,7 +161,7 @@ async function proxyRoblox(request, response, requestUrl) {
     }
 
     targetUrl = `https://apis.roblox.com/universes/v1/places/${placeId}/universe`
-    fallbackUrl = `https://apis.roproxy.com/universes/v1/places/${placeId}/universe`
+    fallbackUrl = `https://apis.rotunnel.com/universes/v1/places/${placeId}/universe`
   } else if (routePath === '/places') {
     const universeId = requestUrl.searchParams.get('universeId')
 
@@ -88,7 +181,7 @@ async function proxyRoblox(request, response, requestUrl) {
     }
 
     targetUrl = `https://develop.roblox.com/v1/universes/${universeId}/places?${params}`
-    fallbackUrl = `https://develop.roproxy.com/v1/universes/${universeId}/places?${params}`
+    fallbackUrl = `https://develop.rotunnel.com/v1/universes/${universeId}/places?${params}`
   } else if (
     routePath === '/access' ||
     routePath === '/accessibility' ||
@@ -102,14 +195,14 @@ async function proxyRoblox(request, response, requestUrl) {
     }
 
     try {
-      const gamePageResponse = await fetch(`https://www.roblox.com/games/${placeId}`, {
-        headers: robloxHeaders,
-        redirect: 'manual',
-      })
+      const targetUrl = `https://www.roblox.com/games/${placeId}`
+      const gamePageResponse = await fetchRobloxFollowingRedirects(request, targetUrl)
 
       sendJson(response, 200, {
         status: gamePageResponse.status,
-        accessible: gamePageResponse.status === 200,
+        accessible: gamePageResponse.ok,
+        redirected: gamePageResponse.redirected,
+        url: gamePageResponse.url,
       })
     } catch {
       sendJson(response, 502, { error: 'Roblox accessibility check failed.' })
@@ -125,14 +218,50 @@ async function proxyRoblox(request, response, requestUrl) {
     }
 
     targetUrl = `https://games.roblox.com/v1/games?universeIds=${universeId}`
-    fallbackUrl = `https://games.roproxy.com/v1/games?universeIds=${universeId}`
+    fallbackUrl = `https://games.rotunnel.com/v1/games?universeIds=${universeId}`
+  } else if (
+    routePath === '/place-details' ||
+    routePath === '/games/multiget-place-details' ||
+    routePath === '/v1/games/multiget-place-details' ||
+    routePath.endsWith('/multiget-place-details')
+  ) {
+    const placeId =
+      requestUrl.searchParams.get('placeId') ?? requestUrl.searchParams.get('placeIds')
+
+    if (!/^\d+$/.test(placeId ?? '')) {
+      sendJson(response, 400, { error: 'A numeric placeId or placeIds value is required.' })
+      return
+    }
+
+    targetUrl = `https://games.roblox.com/v1/games/multiget-place-details?placeIds=${placeId}`
+
+    try {
+      const placeDetailsResponse = await fetchRoblox(request, targetUrl)
+
+      if (!placeDetailsResponse.ok) {
+        sendJson(response, 200, [{ placeId: Number(placeId), isPlayable: false }])
+        return
+      }
+
+      const body = await placeDetailsResponse.text()
+
+      response.writeHead(placeDetailsResponse.status, {
+        'content-type': placeDetailsResponse.headers.get('content-type') ?? 'application/json',
+        'cache-control': 'no-store',
+      })
+      response.end(body)
+    } catch {
+      sendJson(response, 502, { error: 'Roblox place details request failed.' })
+    }
+
+    return
   } else {
     sendJson(response, 404, { error: 'Unknown Roblox API route.' })
     return
   }
 
   try {
-    let robloxResponse = await fetch(targetUrl, { headers: robloxHeaders })
+    let robloxResponse = await fetchRoblox(request, targetUrl)
 
     if (!robloxResponse.ok && fallbackUrl) {
       robloxResponse = await fetch(fallbackUrl, { headers: robloxHeaders })

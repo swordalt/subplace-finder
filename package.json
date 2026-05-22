@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "deploy": "node scripts/deploy-github-pages.mjs",
     "host": "node scripts/build-and-host.mjs",
     "preview": "vite preview"
   },

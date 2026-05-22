@@ -2,8 +2,31 @@ import './App.css'
 import { useState } from 'react'
 
 const PLACE_ID_PATTERN = /^\d+$/
+const AUTH_TOKEN_STORAGE_KEY = 'subplaceFinder.authToken'
 const REQUEST_HEADERS = {
   Accept: 'application/json',
+}
+
+function getStoredAuthToken() {
+  if (typeof window === 'undefined') {
+    return ''
+  }
+
+  return window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) ?? ''
+}
+
+function buildRequestHeaders(url, authToken, headers = {}) {
+  const requestHeaders = {
+    ...REQUEST_HEADERS,
+    ...headers,
+  }
+  const trimmedToken = authToken.trim()
+
+  if (trimmedToken && url.startsWith('/api/roblox')) {
+    requestHeaders['X-Roblox-Security'] = trimmedToken
+  }
+
+  return requestHeaders
 }
 
 function parsePlaceId(value) {
@@ -42,9 +65,10 @@ function parsePlaceId(value) {
   throw new Error('Could not find a place ID in that URL.')
 }
 
-async function fetchJson(url, errorMessage) {
+async function fetchJson(url, errorMessage, authToken = '', options = {}) {
   const response = await fetch(url, {
-    headers: REQUEST_HEADERS,
+    ...options,
+    headers: buildRequestHeaders(url, authToken, options.headers),
   })
   const contentType = response.headers.get('content-type') ?? ''
 
@@ -59,12 +83,12 @@ async function fetchJson(url, errorMessage) {
   return response.json()
 }
 
-async function fetchFirstJson(urls, errorMessage) {
+async function fetchFirstJson(urls, errorMessage, authToken = '', options = {}) {
   let lastError
 
   for (const url of urls) {
     try {
-      return await fetchJson(url, errorMessage)
+      return await fetchJson(url, errorMessage, authToken, options)
     } catch (error) {
       lastError = error
     }
@@ -73,14 +97,15 @@ async function fetchFirstJson(urls, errorMessage) {
   throw lastError ?? new Error(errorMessage)
 }
 
-async function fetchSubplaces(placeId) {
+async function fetchSubplaces(placeId, authToken) {
   const encodedPlaceId = encodeURIComponent(placeId)
   const universeData = await fetchFirstJson(
     [
       `/api/roblox/universe?placeId=${encodedPlaceId}`,
-      `https://apis.roproxy.com/universes/v1/places/${encodedPlaceId}/universe`,
+      `https://apis.rotunnel.com/universes/v1/places/${encodedPlaceId}/universe`,
     ],
     'Could not find a universe for that place ID',
+    authToken,
   )
 
   if (!universeData.universeId) {
@@ -106,9 +131,10 @@ async function fetchSubplaces(placeId) {
     const placesData = await fetchFirstJson(
       [
         `/api/roblox/places?${proxyParams}`,
-        `https://develop.roproxy.com/v1/universes/${universeData.universeId}/places?${params}`,
+        `https://develop.rotunnel.com/v1/universes/${universeData.universeId}/places?${params}`,
       ],
       'Could not load subplaces for that universe',
+      authToken,
     )
 
     places.push(...(placesData.data ?? []))
@@ -121,24 +147,26 @@ async function fetchSubplaces(placeId) {
   }
 }
 
-async function fetchExperienceAccess(placeId) {
+async function fetchExperienceAccess(placeId, authToken) {
   const encodedPlaceId = encodeURIComponent(placeId)
   const accessData = await fetchJson(
     `/api/roblox/access?placeId=${encodedPlaceId}`,
     'Could not check whether that experience is public',
+    authToken,
   )
 
   return accessData
 }
 
-async function fetchRootPlaceId(universeId) {
+async function fetchRootPlaceId(universeId, authToken) {
   const encodedUniverseId = encodeURIComponent(universeId)
   const gameData = await fetchFirstJson(
     [
       `/api/roblox/game?universeId=${encodedUniverseId}`,
-      `https://games.roproxy.com/v1/games?universeIds=${encodedUniverseId}`,
+      `https://games.rotunnel.com/v1/games?universeIds=${encodedUniverseId}`,
     ],
     'Could not load root place details for that universe',
+    authToken,
   )
   const rootPlaceId = gameData.data?.[0]?.rootPlaceId
 
@@ -151,20 +179,100 @@ async function fetchRootPlaceId(universeId) {
   return rootPlaceId
 }
 
+async function fetchPlacePlayability(placeId, authToken) {
+  const encodedPlaceId = encodeURIComponent(placeId)
+  const placeDetails = await fetchJson(
+    `/api/roblox/v1/games/multiget-place-details?placeIds=${encodedPlaceId}`,
+    'Could not check whether that subplace is joinable',
+    authToken,
+  )
+  const details = Array.isArray(placeDetails) ? placeDetails[0] : placeDetails.data?.[0]
+
+  return Boolean(details?.isPlayable)
+}
+
 function App() {
   const [query, setQuery] = useState('')
+  const [authToken, setAuthToken] = useState(getStoredAuthToken)
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
   const [status, setStatus] = useState('idle')
   const [rootStatus, setRootStatus] = useState('idle')
   const [error, setError] = useState('')
   const [rootError, setRootError] = useState('')
   const [accessWarning, setAccessWarning] = useState('')
+  const [joinStates, setJoinStates] = useState({})
   const [result, setResult] = useState(null)
+
+  function handleAuthTokenChange(event) {
+    const nextToken = event.target.value
+
+    setAuthToken(nextToken)
+    setJoinStates({})
+    window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, nextToken)
+  }
+
+  async function handleJoinCheck(placeId) {
+    if (!authToken.trim()) {
+      return
+    }
+
+    const currentState = joinStates[placeId]?.status
+
+    if (currentState === 'checking' || currentState === 'playable' || currentState === 'locked') {
+      return
+    }
+
+    setJoinStates((currentStates) => ({
+      ...currentStates,
+      [placeId]: { status: 'checking' },
+    }))
+
+    try {
+      const isPlayable = await fetchPlacePlayability(placeId, authToken)
+      setJoinStates((currentStates) => ({
+        ...currentStates,
+        [placeId]: { status: isPlayable ? 'playable' : 'locked' },
+      }))
+    } catch {
+      setJoinStates((currentStates) => ({
+        ...currentStates,
+        [placeId]: { status: 'locked' },
+      }))
+    }
+  }
+
+  function handleJoin(placeId) {
+    window.location.href = `roblox://placeId=${placeId}`
+  }
+
+  function getJoinLabel(placeId) {
+    if (!authToken.trim()) {
+      return 'Join'
+    }
+
+    const state = joinStates[placeId]?.status
+
+    if (state === 'checking') {
+      return 'Checking'
+    }
+
+    if (state === 'playable') {
+      return 'Join'
+    }
+
+    if (state === 'locked') {
+      return 'Locked'
+    }
+
+    return 'Check'
+  }
 
   async function handleSubmit(event) {
     event.preventDefault()
     setError('')
     setRootError('')
     setAccessWarning('')
+    setJoinStates({})
     setResult(null)
     setRootStatus('idle')
 
@@ -181,7 +289,7 @@ function App() {
     setStatus('loading')
 
     try {
-      const subplaceResult = await fetchSubplaces(placeId)
+      const subplaceResult = await fetchSubplaces(placeId, authToken)
       setResult({
         ...subplaceResult,
         placeId,
@@ -190,9 +298,9 @@ function App() {
       setRootStatus('loading')
 
       try {
-        const accessData = await fetchExperienceAccess(placeId)
+        const accessData = await fetchExperienceAccess(placeId, authToken)
 
-        if (accessData.status === 302) {
+        if (!accessData.accessible) {
           setAccessWarning(
             `Status ${accessData.status} instead of 200; this game may be restricted or inaccessible.`,
           )
@@ -204,7 +312,7 @@ function App() {
       }
 
       try {
-        const rootPlaceId = await fetchRootPlaceId(subplaceResult.universeId)
+        const rootPlaceId = await fetchRootPlaceId(subplaceResult.universeId, authToken)
         setResult((currentResult) => ({
           ...currentResult,
           rootPlaceId,
@@ -229,9 +337,50 @@ function App() {
 
   const isLoading = status === 'loading'
   const hasPlaces = result?.places?.length > 0
+  const hasAuthToken = authToken.trim().length > 0
 
   return (
     <main className="app-shell">
+      <div className="settings-area">
+        <button
+          className="settings-button"
+          type="button"
+          aria-label="Open settings"
+          aria-expanded={isSettingsOpen}
+          aria-controls="settings-menu"
+          onClick={() => setIsSettingsOpen((currentValue) => !currentValue)}
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24">
+            <path d="M19.4 13.5a7.8 7.8 0 0 0 .1-1.5 7.8 7.8 0 0 0-.1-1.5l2-1.5-2-3.5-2.4 1a8.3 8.3 0 0 0-2.6-1.5L14 2.4h-4L9.6 5a8.3 8.3 0 0 0-2.6 1.5l-2.4-1-2 3.5 2 1.5a7.8 7.8 0 0 0-.1 1.5 7.8 7.8 0 0 0 .1 1.5l-2 1.5 2 3.5 2.4-1a8.3 8.3 0 0 0 2.6 1.5l.4 2.6h4l.4-2.6a8.3 8.3 0 0 0 2.6-1.5l2.4 1 2-3.5-2-1.5ZM12 15.5A3.5 3.5 0 1 1 12 8a3.5 3.5 0 0 1 0 7.5Z" />
+          </svg>
+        </button>
+
+        {isSettingsOpen && (
+          <section
+            className="settings-menu"
+            id="settings-menu"
+            aria-labelledby="settings-title"
+          >
+            <h2 id="settings-title">Settings</h2>
+            <div className="settings-field">
+              <label htmlFor="auth-token">Authentication</label>
+              <input
+                id="auth-token"
+                type="password"
+                value={authToken}
+                onChange={handleAuthTokenChange}
+                placeholder=".ROBLOSECURITY token"
+                autoComplete="off"
+              />
+              <p>
+                Used as the .ROBLOSECURITY cookie for Roblox API requests when
+                applicable. This value stays in your browser.
+              </p>
+            </div>
+          </section>
+        )}
+      </div>
+
       <section className="search-view" aria-labelledby="app-title">
         <div className="intro">
           <h1 id="app-title">Subplace Finder</h1>
@@ -333,9 +482,23 @@ function App() {
                         <code>{place.id}</code>
                       </td>
                       <td>
-                        <a className="join-link" href={`roblox://placeId=${place.id}`}>
-                          Join
-                        </a>
+                        <span
+                          className="join-control"
+                          onFocus={() => handleJoinCheck(place.id)}
+                          onMouseEnter={() => handleJoinCheck(place.id)}
+                        >
+                          <button
+                            className="join-button"
+                            type="button"
+                            disabled={
+                              hasAuthToken &&
+                              joinStates[place.id]?.status !== 'playable'
+                            }
+                            onClick={() => handleJoin(place.id)}
+                          >
+                            {getJoinLabel(place.id)}
+                          </button>
+                        </span>
                       </td>
                     </tr>
                   ))}
